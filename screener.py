@@ -208,38 +208,107 @@ def score_pair(pair):
     return vol_liq_score + mom_1h_score + mom_5m_score + mom_6h_score + buy_score + accel_score
 
 
+# ---- Recommendation ----------------------------------------------------------
+
+def recommendation_score(pair, score):
+    """
+    Returns a 0-100 confidence score for a strong entry recommendation,
+    or 0 if the coin doesn't meet the stricter multi-signal criteria.
+
+    Requires ALL of:
+      - Base score >= 60
+      - 1h momentum >= 15%  (sustained move, not a flash)
+      - 5m momentum >= 3%   (still moving right now)
+      - Buy ratio  >= 60%   (buyers outnumber sellers)
+      - Age 1-18h           (young enough to have upside, old enough to trust)
+      - Vol/Liq   >= 4x     (strong relative money flow)
+
+    Confidence then grades how well each criterion is exceeded.
+    """
+    liq    = (pair.get("liquidity") or {}).get("usd") or 0
+    vol24  = (pair.get("volume")    or {}).get("h24") or 0
+    vol_h1 = (pair.get("volume")    or {}).get("h1")  or 0
+    vol_m5 = (pair.get("volume")    or {}).get("m5")  or 0
+    pc     = pair.get("priceChange") or {}
+    p5m    = pc.get("m5") or 0
+    p1h    = pc.get("h1") or 0
+    h1_tx  = (pair.get("txns") or {}).get("h1") or {}
+    buys   = h1_tx.get("buys")  or 0
+    sells  = h1_tx.get("sells") or 0
+    age    = _pair_age_hours(pair)
+    buy_ratio  = buys / (buys + sells) if (buys + sells) > 0 else 0
+    vol_liq    = vol24 / liq if liq > 0 else 0
+
+    # All gates must pass
+    if score < 60:         return 0
+    if p1h < 15:           return 0
+    if p5m < 3:            return 0
+    if buy_ratio < 0.60:   return 0
+    if not (1 <= age <= 18): return 0
+    if vol_liq < 4:        return 0
+
+    # Grade how far each signal exceeds its minimum
+    conf  = min(score, 100) / 100 * 30             # base score (30 pts)
+    conf += min(p1h, 60) / 60 * 25                 # 1h momentum up to 60% (25 pts)
+    conf += min(p5m, 20) / 20 * 15                 # 5m momentum up to 20% (15 pts)
+    conf += (buy_ratio - 0.60) / 0.40 * 15         # buy ratio 60-100%     (15 pts)
+    avg_5m = vol_h1 / 12 if vol_h1 > 0 else 0
+    accel  = vol_m5 / avg_5m if avg_5m > 0 else 1
+    conf += min(accel, 5) / 5 * 15                 # vol acceleration up to 5x (15 pts)
+
+    return min(conf, 100)
+
+
 # ---- Notification ------------------------------------------------------------
+
+def _pair_summary(score, pair, rank=None, conf=None):
+    sym    = pair["baseToken"].get("symbol", "?")
+    name   = pair["baseToken"].get("name", "")
+    liq    = (pair.get("liquidity") or {}).get("usd") or 0
+    vol    = (pair.get("volume") or {}).get("h24") or 0
+    vol_h1 = (pair.get("volume") or {}).get("h1") or 0
+    vol_m5 = (pair.get("volume") or {}).get("m5") or 0
+    pc     = pair.get("priceChange") or {}
+    p5m    = pc.get("m5") or 0
+    p1h    = pc.get("h1") or 0
+    url    = pair.get("url", "")
+    age    = _pair_age_hours(pair)
+    avg_5m = vol_h1 / 12 if vol_h1 > 0 else 0
+    accel  = vol_m5 / avg_5m if avg_5m > 0 else 0
+    accel_tag = f"  ACCEL {accel:.1f}x\n" if accel >= 2 else ""
+    prefix = f"#{rank} " if rank else ""
+    conf_tag = f"  Confidence: {conf:.0f}/100\n" if conf is not None else ""
+    return (
+        f"{prefix}{sym} ({name})\n"
+        f"   Score: {score:.0f}/100  Age: {age:.0f}h\n"
+        f"{conf_tag}"
+        f"   Liq: ${liq:,.0f}  24h Vol: ${vol:,.0f}\n"
+        f"   5m: {p5m:+.1f}%  1h: {p1h:+.1f}%\n"
+        f"{accel_tag}"
+        f"   {url}\n"
+    )
+
 
 def send_notification(ranked_coins):
     """Push top coins to phone via ntfy.sh."""
+    # Compute recommendation confidence for each coin
+    picks = [
+        (recommendation_score(pair, score), score, pair)
+        for score, pair in ranked_coins
+    ]
+    picks.sort(key=lambda x: x[0], reverse=True)
+    recommended = [(conf, score, pair) for conf, score, pair in picks if conf > 0][:2]
+
     lines = [f"Solana screener: {len(ranked_coins)} coin(s) detected\n"]
 
+    if recommended:
+        lines.append("★ RECOMMENDED ENTRY ★")
+        for conf, score, pair in recommended:
+            lines.append(_pair_summary(score, pair, conf=conf))
+        lines.append("--- All signals ---")
+
     for i, (score, pair) in enumerate(ranked_coins, 1):
-        sym    = pair["baseToken"].get("symbol", "?")
-        name   = pair["baseToken"].get("name", "")
-        liq    = (pair.get("liquidity") or {}).get("usd") or 0
-        vol    = (pair.get("volume") or {}).get("h24") or 0
-        vol_m5 = (pair.get("volume") or {}).get("m5") or 0
-        pc     = pair.get("priceChange") or {}
-        p5m    = pc.get("m5") or 0
-        p1h    = pc.get("h1") or 0
-        url    = pair.get("url", "")
-        age    = _pair_age_hours(pair)
-
-        # Volume acceleration label
-        vol_h1 = (pair.get("volume") or {}).get("h1") or 0
-        avg_5m = vol_h1 / 12 if vol_h1 > 0 else 0
-        accel  = vol_m5 / avg_5m if avg_5m > 0 else 0
-        accel_tag = f"  ACCEL {accel:.1f}x\n" if accel >= 2 else ""
-
-        lines.append(
-            f"#{i} {sym} ({name})\n"
-            f"   Score: {score:.0f}/100  Age: {age:.0f}h\n"
-            f"   Liq: ${liq:,.0f}  24h Vol: ${vol:,.0f}\n"
-            f"   5m: {p5m:+.1f}%  1h: {p1h:+.1f}%\n"
-            f"{accel_tag}"
-            f"   {url}\n"
-        )
+        lines.append(_pair_summary(score, pair, rank=i))
 
     message = "\n".join(lines)
     try:
