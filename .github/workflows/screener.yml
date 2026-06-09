@@ -1,0 +1,38 @@
+name: Memecoin Screener
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:         # manual trigger from GitHub UI
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Persist seen-tokens cache between runs so we don't spam alerts
+      - name: Restore seen-tokens cache
+        uses: actions/cache@v4
+        with:
+          path: cache/seen.json
+          key: seen-tokens-${{ github.run_id }}
+          restore-keys: |
+            seen-tokens-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run screener
+        run: python screener.py
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # Optional: override the ntfy server
+          # NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
