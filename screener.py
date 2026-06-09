@@ -356,6 +356,7 @@ def run_once():
             scored.append((s, pair))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    scored = [x for x in scored if x[0] >= 50]
     top = scored[:TOP_N]
 
     print(f"  {len(scored)} passed filters -> top {len(top)} selected")
