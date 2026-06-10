@@ -17,8 +17,11 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import quote_plus
 
 import requests
 
@@ -45,6 +48,15 @@ MIN_VOL_LIQ_RATIO = 2.0     # 24h volume >= 2x liquidity
 
 TOP_N = 5                   # coins per notification
 LOOP_INTERVAL_SECS = 300    # 5 min between scans in --loop mode
+
+# Early launch detection — separate pass for ultra-new pairs (< 45 min)
+MAX_EARLY_AGE_MINS  = 45
+MIN_EARLY_LIQ_USD   = 10_000
+MIN_EARLY_5M_PCT    = 15.0
+MIN_EARLY_BUYS      = 10
+MIN_EARLY_BUY_RATIO = 0.60
+MIN_EARLY_ACCEL     = 2.0
+TOP_EARLY_N         = 2
 
 # Dedup — skip coins already alerted within this window
 SEEN_CACHE_FILE = Path("cache/seen.json")
@@ -274,9 +286,71 @@ def recommendation_score(pair, score):
     return min(conf, 100)
 
 
+# ---- Early launch detection --------------------------------------------------
+
+def early_launch_score(pair):
+    """
+    Separate scorer for ultra-new pairs (< 45 min old).
+    Ignores 24h metrics since the coin hasn't existed long enough to build them.
+    Scores purely on immediate momentum: 5m move, buy pressure, volume acceleration.
+    Returns 0-100 or None if filters not met.
+    """
+    liq    = (pair.get("liquidity") or {}).get("usd") or 0
+    vol_h1 = (pair.get("volume") or {}).get("h1") or 0
+    vol_m5 = (pair.get("volume") or {}).get("m5") or 0
+    pc     = pair.get("priceChange") or {}
+    p5m    = pc.get("m5") or 0
+    h1_tx  = (pair.get("txns") or {}).get("h1") or {}
+    buys   = h1_tx.get("buys") or 0
+    sells  = h1_tx.get("sells") or 0
+    age    = _pair_age_hours(pair)
+    buy_ratio = buys / (buys + sells) if (buys + sells) > 0 else 0
+    avg_5m    = vol_h1 / 12 if vol_h1 > 0 else 0
+    accel     = vol_m5 / avg_5m if avg_5m > 0 else 0
+
+    if age > MAX_EARLY_AGE_MINS / 60:   return None
+    if liq < MIN_EARLY_LIQ_USD:         return None
+    if p5m < MIN_EARLY_5M_PCT:          return None
+    if buys < MIN_EARLY_BUYS:           return None
+    if buy_ratio < MIN_EARLY_BUY_RATIO: return None
+    if accel < MIN_EARLY_ACCEL:         return None
+
+    mom_score   = min(p5m, 100) / 100 * 40
+    buy_score   = (buy_ratio - 0.60) / 0.40 * 30
+    accel_score = min(accel, 8) / 8 * 30
+    return mom_score + buy_score + accel_score
+
+
+# ---- News search -------------------------------------------------------------
+
+def fetch_news(name, symbol, max_age_hours=4):
+    """Search Google News RSS for recent articles about the token."""
+    query = quote_plus(f'"{name}" crypto OR "{symbol}" solana')
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+        headlines = []
+        for item in root.findall(".//item")[:8]:
+            title = (item.findtext("title") or "").strip()
+            pub_str = item.findtext("pubDate") or ""
+            try:
+                pub_dt = parsedate_to_datetime(pub_str)
+                if pub_dt >= cutoff and title:
+                    headlines.append(title)
+            except Exception:
+                pass
+        return headlines[:2]
+    except Exception as e:
+        print(f"  [news] {name}: {e}")
+        return []
+
+
 # ---- Notification ------------------------------------------------------------
 
-def _pair_summary(score, pair, rank=None, conf=None):
+def _pair_summary(score, pair, rank=None, conf=None, news=None, early=False):
     sym    = pair["baseToken"].get("symbol", "?")
     name   = pair["baseToken"].get("name", "")
     liq    = (pair.get("liquidity") or {}).get("usd") or 0
@@ -290,23 +364,30 @@ def _pair_summary(score, pair, rank=None, conf=None):
     age    = _pair_age_hours(pair)
     avg_5m = vol_h1 / 12 if vol_h1 > 0 else 0
     accel  = vol_m5 / avg_5m if avg_5m > 0 else 0
-    accel_tag = f"  ACCEL {accel:.1f}x\n" if accel >= 2 else ""
-    prefix = f"#{rank} " if rank else ""
-    conf_tag = f"  Confidence: {conf:.0f}/100\n" if conf is not None else ""
+    accel_tag  = f"  ACCEL {accel:.1f}x\n" if accel >= 2 else ""
+    prefix     = f"#{rank} " if rank else ""
+    conf_tag   = f"  Confidence: {conf:.0f}/100\n" if conf is not None else ""
+    early_tag  = "  EARLY LAUNCH\n" if early else ""
+    news_lines = "".join(f"  NEWS: {h}\n" for h in (news or []))
+    age_str    = f"{age * 60:.0f}min" if early else f"{age:.0f}h"
     return (
         f"{prefix}{sym} ({name})\n"
-        f"   Score: {score:.0f}/100  Age: {age:.0f}h\n"
+        f"   Score: {score:.0f}/100  Age: {age_str}\n"
+        f"{early_tag}"
         f"{conf_tag}"
         f"   Liq: ${liq:,.0f}  24h Vol: ${vol:,.0f}\n"
         f"   5m: {p5m:+.1f}%  1h: {p1h:+.1f}%\n"
         f"{accel_tag}"
+        f"{news_lines}"
         f"   {url}\n"
     )
 
 
-def send_notification(ranked_coins):
+def send_notification(ranked_coins, early_coins=None):
     """Push top coins to phone via ntfy.sh."""
-    # Compute recommendation confidence for each coin
+    early_coins = early_coins or []
+
+    # Compute recommendation confidence for regular coins
     picks = [
         (recommendation_score(pair, score), score, pair)
         for score, pair in ranked_coins
@@ -314,12 +395,24 @@ def send_notification(ranked_coins):
     picks.sort(key=lambda x: x[0], reverse=True)
     recommended = [(conf, score, pair) for conf, score, pair in picks if conf > 0][:2]
 
-    lines = [f"Solana screener: {len(ranked_coins)} coin(s) detected\n"]
+    total = len(ranked_coins) + len(early_coins)
+    lines = [f"Solana screener: {total} coin(s) detected\n"]
+
+    if early_coins:
+        lines.append("*** EARLY LAUNCHES ***")
+        for score, pair in early_coins:
+            sym  = pair["baseToken"].get("symbol", "?")
+            name = pair["baseToken"].get("name", "")
+            news = fetch_news(name, sym)
+            lines.append(_pair_summary(score, pair, early=True, news=news))
 
     if recommended:
         lines.append("★ RECOMMENDED ENTRY ★")
         for conf, score, pair in recommended:
-            lines.append(_pair_summary(score, pair, conf=conf))
+            sym  = pair["baseToken"].get("symbol", "?")
+            name = pair["baseToken"].get("name", "")
+            news = fetch_news(name, sym)
+            lines.append(_pair_summary(score, pair, conf=conf, news=news))
         lines.append("--- All signals ---")
 
     for i, (score, pair) in enumerate(ranked_coins, 1):
@@ -363,20 +456,29 @@ def run_once():
     print(f"  {len(pairs)} pairs retrieved")
 
     scored = []
+    early_scored = []
     for pair in pairs:
         if pair.get("chainId") != "solana":
             continue
+        es = early_launch_score(pair)
+        if es is not None:
+            early_scored.append((es, pair))
+            continue  # don't double-count in regular scorer
         s = score_pair(pair)
         if s is not None:
             scored.append((s, pair))
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    early_scored.sort(key=lambda x: x[0], reverse=True)
+
     scored = [x for x in scored if x[0] >= 60]
-    top = scored[:TOP_N]
+    top       = scored[:TOP_N]
+    top_early = early_scored[:TOP_EARLY_N]
 
     print(f"  {len(scored)} passed filters -> top {len(top)} selected")
+    print(f"  {len(early_scored)} early launches -> top {len(top_early)} selected")
 
-    if not top:
+    if not top and not top_early:
         print("  No coins matched this scan. Market may be quiet or filters too strict.")
         return
 
@@ -387,16 +489,26 @@ def run_once():
         age  = _pair_age_hours(pair)
         print(f"  #{rank} {sym:<10}  age:{age:.0f}h  1h:{p1h:+.1f}%  vol:${vol:,.0f}  score:{score:.0f}")
 
+    for score, pair in top_early:
+        sym  = pair["baseToken"].get("symbol", "?")
+        p5m  = (pair.get("priceChange") or {}).get("m5") or 0
+        age  = _pair_age_hours(pair)
+        print(f"  EARLY {sym:<10}  age:{age*60:.0f}min  5m:{p5m:+.1f}%  score:{score:.0f}")
+
     # Dedup — only alert on coins not seen recently
     seen = load_seen()
     top_new = [
         (s, p) for s, p in top
         if not is_recently_seen(seen, (p.get("baseToken") or {}).get("address", ""))
     ]
+    top_early_new = [
+        (s, p) for s, p in top_early
+        if not is_recently_seen(seen, (p.get("baseToken") or {}).get("address", ""))
+    ]
 
-    if top_new:
-        send_notification(top_new)
-        for _, p in top_new:
+    if top_new or top_early_new:
+        send_notification(top_new, early_coins=top_early_new)
+        for _, p in top_new + top_early_new:
             addr = (p.get("baseToken") or {}).get("address", "")
             if addr:
                 seen = mark_seen(seen, addr)
