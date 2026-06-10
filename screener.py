@@ -171,10 +171,12 @@ def score_pair(pair):
     p5m    = pc.get("m5") or 0
     p1h    = pc.get("h1") or 0
     p6h    = pc.get("h6") or 0
+    p24h   = pc.get("h24") or 0
     h1_tx  = (pair.get("txns") or {}).get("h1") or {}
     buys   = h1_tx.get("buys")  or 0
     sells  = h1_tx.get("sells") or 0
     age    = _pair_age_hours(pair)
+    buy_ratio = buys / (buys + sells) if (buys + sells) > 0 else 0
 
     # Hard filters
     if not (MIN_LIQ_USD <= liq <= MAX_LIQ_USD):
@@ -186,6 +188,19 @@ def score_pair(pair):
     if liq == 0 or vol24 / liq < MIN_VOL_LIQ_RATIO:
         return None
     if p5m < MIN_PRICE_5M_PCT and p1h < MIN_PRICE_1H_PCT:
+        return None
+    # Dead cat bounce: skip coins already down big over 24h
+    if p24h < -30:
+        return None
+    # Require buyers to outnumber sellers
+    if buy_ratio < 0.55:
+        return None
+    # Require meaningful transaction activity (filters wash trading / thin markets)
+    if buys < 30:
+        return None
+    # Momentum freshness: current 5m pace must be at least half the implied hourly pace.
+    # Catches moves that already peaked — coin up 40% in 1h but barely moving now.
+    if p1h > 0 and p5m < (p1h / 12) * 0.5:
         return None
 
     # Vol/liq ratio score
@@ -244,7 +259,7 @@ def recommendation_score(pair, score):
     if p1h < 15:           return 0
     if p5m < 3:            return 0
     if buy_ratio < 0.60:   return 0
-    if not (1 <= age <= 18): return 0
+    if not (2 <= age <= 12): return 0
     if vol_liq < 4:        return 0
 
     # Grade how far each signal exceeds its minimum
@@ -356,7 +371,7 @@ def run_once():
             scored.append((s, pair))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    scored = [x for x in scored if x[0] >= 50]
+    scored = [x for x in scored if x[0] >= 60]
     top = scored[:TOP_N]
 
     print(f"  {len(scored)} passed filters -> top {len(top)} selected")
