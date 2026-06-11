@@ -3,4 +3,5 @@ __pycache__/
 .env
 venv/
 .venv/
-cache/
+cache/*
+!cache/seen.json

@@ -1,11 +1,15 @@
 name: Memecoin Screener
 
 on:
-  workflow_dispatch:         # manual trigger from GitHub UI only
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:         # also keep manual trigger
 
 jobs:
   screen:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed to push the seen-tokens cache back
 
     steps:
       - name: Checkout
@@ -16,15 +20,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Persist seen-tokens cache between runs so we don't spam alerts
-      - name: Restore seen-tokens cache
-        uses: actions/cache@v4
-        with:
-          path: cache/seen.json
-          key: seen-tokens-${{ github.run_id }}
-          restore-keys: |
-            seen-tokens-
-
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -34,3 +29,12 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           # Optional: override the ntfy server
           # NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+
+      - name: Persist seen-tokens cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p cache
+          git add cache/seen.json
+          git diff --staged --quiet || git commit -m "chore: update seen-tokens cache [skip ci]"
+          git push

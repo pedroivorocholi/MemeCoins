@@ -41,7 +41,7 @@ MAX_AGE_HOURS = 48          # pair must be newer than 48h
 
 # Momentum — at least one must pass
 MIN_PRICE_5M_PCT = 2.0      # +2%  in the last 5 minutes
-MIN_PRICE_1H_PCT = 8.0      # +8%  in the last 1 hour
+MIN_PRICE_1H_PCT = 3.0      # +3%  in the last 1 hour (lowered: catch coins before big 1h move)
 
 # Core signal: money rushing in relative to pool size
 MIN_VOL_LIQ_RATIO = 2.0     # 24h volume >= 2x liquidity
@@ -52,11 +52,11 @@ LOOP_INTERVAL_SECS = 300    # 5 min between scans in --loop mode
 # Early launch detection — separate pass for ultra-new pairs (< 45 min)
 MAX_EARLY_AGE_MINS  = 45
 MIN_EARLY_LIQ_USD   = 10_000
-MIN_EARLY_5M_PCT    = 15.0
-MIN_EARLY_BUYS      = 10
+MIN_EARLY_5M_PCT    = 8.0    # was 15 — catch smaller initial moves
+MIN_EARLY_BUYS      = 8      # was 10 — fewer txns needed for brand-new pairs
 MIN_EARLY_BUY_RATIO = 0.60
-MIN_EARLY_ACCEL     = 2.0
-TOP_EARLY_N         = 2
+MIN_EARLY_ACCEL     = 1.5    # was 2.0 — detect accumulation before volume explosion
+TOP_EARLY_N         = 3      # was 2 — surface more early candidates
 
 # Dedup — skip coins already alerted within this window
 SEEN_CACHE_FILE = Path("cache/seen.json")
@@ -167,13 +167,13 @@ def score_pair(pair):
     """
     Returns a 0-100 composite score, or None if the pair fails hard filters.
 
-    Score breakdown:
-      35 pts -- volume/liquidity ratio  (money rushing in vs pool size)
-      20 pts -- 1h price momentum
-      15 pts -- 5m price momentum
-      10 pts -- 6h price momentum
-      10 pts -- buy-side pressure (buys / total txns in last hour)
-      10 pts -- volume acceleration (m5 volume vs hourly average)
+    Score breakdown (leading signals weighted higher to catch moves earlier):
+      25 pts -- volume/liquidity ratio  (money rushing in vs pool size)
+      25 pts -- 5m price momentum       (what is happening RIGHT NOW)
+      20 pts -- buy transaction accel   (m5 buys vs h1 average — leads price)
+      15 pts -- volume acceleration     (m5 vol vs h1 average)
+      10 pts -- 1h price momentum       (context, not the primary signal)
+       5 pts -- buy-side pressure (buys / total txns in last hour)
     """
     liq    = (pair.get("liquidity") or {}).get("usd") or 0
     vol24  = (pair.get("volume")    or {}).get("h24") or 0
@@ -185,8 +185,10 @@ def score_pair(pair):
     p6h    = pc.get("h6") or 0
     p24h   = pc.get("h24") or 0
     h1_tx  = (pair.get("txns") or {}).get("h1") or {}
+    m5_tx  = (pair.get("txns") or {}).get("m5") or {}
     buys   = h1_tx.get("buys")  or 0
     sells  = h1_tx.get("sells") or 0
+    m5_buys = m5_tx.get("buys") or 0
     age    = _pair_age_hours(pair)
     buy_ratio = buys / (buys + sells) if (buys + sells) > 0 else 0
 
@@ -216,23 +218,29 @@ def score_pair(pair):
         return None
 
     # Vol/liq ratio score
-    vol_liq_score = min(vol24 / liq, 50) / 50 * 35
+    vol_liq_score = min(vol24 / liq, 50) / 50 * 25
 
-    # Momentum scores
-    mom_1h_score  = min(max(p1h, 0), 100) / 100 * 20
-    mom_5m_score  = min(max(p5m, 0), 50)  / 50  * 15
-    mom_6h_score  = min(max(p6h, 0), 200) / 200 * 10
+    # 5m momentum (primary leading signal)
+    mom_5m_score = min(max(p5m, 0), 50) / 50 * 25
+
+    # Buy transaction acceleration: m5 buys vs average 5-min slice of h1.
+    # This leads price — accumulation happens before the candle prints green.
+    avg_m5_buys  = buys / 12 if buys > 0 else 0
+    buy_accel    = (m5_buys / avg_m5_buys) if avg_m5_buys > 0 else 1.0
+    buy_accel_score = min(buy_accel, 5) / 5 * 20
+
+    # Volume acceleration (m5 vol vs h1 average)
+    avg_5m_vol  = vol_h1 / 12 if vol_h1 > 0 else 0
+    vol_accel   = (vol_m5 / avg_5m_vol) if avg_5m_vol > 0 else 1.0
+    accel_score = min(vol_accel, 5) / 5 * 15
+
+    # 1h momentum (context signal, not the primary driver)
+    mom_1h_score = min(max(p1h, 0), 100) / 100 * 10
 
     # Buy pressure (1h)
-    buy_score = (buys / (buys + sells) * 10) if (buys + sells) > 0 else 0
+    buy_score = (buy_ratio * 5) if (buys + sells) > 0 else 0
 
-    # Volume acceleration: compare last 5m to the avg 5-min slice of the last hour.
-    # A ratio > 2 means volume is surging in the last 5 minutes — early spike signal.
-    avg_5m_vol = vol_h1 / 12 if vol_h1 > 0 else 0
-    accel_ratio = (vol_m5 / avg_5m_vol) if avg_5m_vol > 0 else 1.0
-    accel_score = min(accel_ratio, 5) / 5 * 10  # caps at 5x acceleration
-
-    return vol_liq_score + mom_1h_score + mom_5m_score + mom_6h_score + buy_score + accel_score
+    return vol_liq_score + mom_5m_score + buy_accel_score + accel_score + mom_1h_score + buy_score
 
 
 # ---- Recommendation ----------------------------------------------------------
@@ -266,18 +274,24 @@ def recommendation_score(pair, score):
     buy_ratio  = buys / (buys + sells) if (buys + sells) > 0 else 0
     vol_liq    = vol24 / liq if liq > 0 else 0
 
+    m5_tx   = (pair.get("txns") or {}).get("m5") or {}
+    m5_buys = m5_tx.get("buys") or 0
+    avg_m5_buys = buys / 12 if buys > 0 else 0
+    buy_accel   = m5_buys / avg_m5_buys if avg_m5_buys > 0 else 1.0
+
     # All gates must pass
-    if score < 60:         return 0
-    if p1h < 15:           return 0
-    if p5m < 3:            return 0
-    if buy_ratio < 0.60:   return 0
-    if not (2 <= age <= 12): return 0
-    if vol_liq < 4:        return 0
+    if score < 60:              return 0
+    if p1h < 5:                 return 0   # was 15 — catch coins before big 1h move
+    if p5m < 3:                 return 0
+    if buy_ratio < 0.60:        return 0
+    if not (0.5 <= age <= 18):  return 0   # was 2h min — allow 30-min-old coins
+    if vol_liq < 4:             return 0
+    if buy_accel < 1.5:         return 0   # must show accelerating buys right now
 
     # Grade how far each signal exceeds its minimum
-    conf  = min(score, 100) / 100 * 30             # base score (30 pts)
-    conf += min(p1h, 60) / 60 * 25                 # 1h momentum up to 60% (25 pts)
-    conf += min(p5m, 20) / 20 * 15                 # 5m momentum up to 20% (15 pts)
+    conf  = min(score, 100) / 100 * 20             # base score (20 pts)
+    conf += min(p5m, 30) / 30 * 25                 # 5m momentum up to 30% (25 pts)
+    conf += min(buy_accel, 5) / 5 * 25             # buy accel up to 5x    (25 pts)
     conf += (buy_ratio - 0.60) / 0.40 * 15         # buy ratio 60-100%     (15 pts)
     avg_5m = vol_h1 / 12 if vol_h1 > 0 else 0
     accel  = vol_m5 / avg_5m if avg_5m > 0 else 1
@@ -292,33 +306,40 @@ def early_launch_score(pair):
     """
     Separate scorer for ultra-new pairs (< 45 min old).
     Ignores 24h metrics since the coin hasn't existed long enough to build them.
-    Scores purely on immediate momentum: 5m move, buy pressure, volume acceleration.
+    Scores on immediate momentum: 5m move, buy transaction acceleration, buy pressure,
+    and volume acceleration. Buy accel (txns.m5.buys vs h1 average) is the primary
+    leading signal — it shows accumulation before price has printed a big move.
     Returns 0-100 or None if filters not met.
     """
-    liq    = (pair.get("liquidity") or {}).get("usd") or 0
-    vol_h1 = (pair.get("volume") or {}).get("h1") or 0
-    vol_m5 = (pair.get("volume") or {}).get("m5") or 0
-    pc     = pair.get("priceChange") or {}
-    p5m    = pc.get("m5") or 0
-    h1_tx  = (pair.get("txns") or {}).get("h1") or {}
-    buys   = h1_tx.get("buys") or 0
-    sells  = h1_tx.get("sells") or 0
-    age    = _pair_age_hours(pair)
-    buy_ratio = buys / (buys + sells) if (buys + sells) > 0 else 0
-    avg_5m    = vol_h1 / 12 if vol_h1 > 0 else 0
-    accel     = vol_m5 / avg_5m if avg_5m > 0 else 0
+    liq     = (pair.get("liquidity") or {}).get("usd") or 0
+    vol_h1  = (pair.get("volume") or {}).get("h1") or 0
+    vol_m5  = (pair.get("volume") or {}).get("m5") or 0
+    pc      = pair.get("priceChange") or {}
+    p5m     = pc.get("m5") or 0
+    h1_tx   = (pair.get("txns") or {}).get("h1") or {}
+    m5_tx   = (pair.get("txns") or {}).get("m5") or {}
+    buys    = h1_tx.get("buys") or 0
+    sells   = h1_tx.get("sells") or 0
+    m5_buys = m5_tx.get("buys") or 0
+    age     = _pair_age_hours(pair)
+    buy_ratio  = buys / (buys + sells) if (buys + sells) > 0 else 0
+    avg_5m_vol = vol_h1 / 12 if vol_h1 > 0 else 0
+    vol_accel  = vol_m5 / avg_5m_vol if avg_5m_vol > 0 else 0
+    avg_m5_buys = buys / 12 if buys > 0 else 0
+    buy_accel   = m5_buys / avg_m5_buys if avg_m5_buys > 0 else 0
 
     if age > MAX_EARLY_AGE_MINS / 60:   return None
     if liq < MIN_EARLY_LIQ_USD:         return None
     if p5m < MIN_EARLY_5M_PCT:          return None
     if buys < MIN_EARLY_BUYS:           return None
     if buy_ratio < MIN_EARLY_BUY_RATIO: return None
-    if accel < MIN_EARLY_ACCEL:         return None
+    if vol_accel < MIN_EARLY_ACCEL:     return None
 
-    mom_score   = min(p5m, 100) / 100 * 40
-    buy_score   = (buy_ratio - 0.60) / 0.40 * 30
-    accel_score = min(accel, 8) / 8 * 30
-    return mom_score + buy_score + accel_score
+    mom_score        = min(p5m, 100) / 100 * 30
+    buy_accel_score  = min(buy_accel, 8) / 8 * 40  # primary leading signal
+    buy_ratio_score  = (buy_ratio - 0.60) / 0.40 * 15
+    vol_accel_score  = min(vol_accel, 8) / 8 * 15
+    return mom_score + buy_accel_score + buy_ratio_score + vol_accel_score
 
 
 # ---- News search -------------------------------------------------------------
@@ -351,25 +372,31 @@ def fetch_news(name, symbol, max_age_hours=4):
 # ---- Notification ------------------------------------------------------------
 
 def _pair_summary(score, pair, rank=None, conf=None, news=None, early=False):
-    sym    = pair["baseToken"].get("symbol", "?")
-    name   = pair["baseToken"].get("name", "")
-    liq    = (pair.get("liquidity") or {}).get("usd") or 0
-    vol    = (pair.get("volume") or {}).get("h24") or 0
-    vol_h1 = (pair.get("volume") or {}).get("h1") or 0
-    vol_m5 = (pair.get("volume") or {}).get("m5") or 0
-    pc     = pair.get("priceChange") or {}
-    p5m    = pc.get("m5") or 0
-    p1h    = pc.get("h1") or 0
-    url    = pair.get("url", "")
-    age    = _pair_age_hours(pair)
-    avg_5m = vol_h1 / 12 if vol_h1 > 0 else 0
-    accel  = vol_m5 / avg_5m if avg_5m > 0 else 0
-    accel_tag  = f"  ACCEL {accel:.1f}x\n" if accel >= 2 else ""
-    prefix     = f"#{rank} " if rank else ""
-    conf_tag   = f"  Confidence: {conf:.0f}/100\n" if conf is not None else ""
-    early_tag  = "  EARLY LAUNCH\n" if early else ""
-    news_lines = "".join(f"  NEWS: {h}\n" for h in (news or []))
-    age_str    = f"{age * 60:.0f}min" if early else f"{age:.0f}h"
+    sym     = pair["baseToken"].get("symbol", "?")
+    name    = pair["baseToken"].get("name", "")
+    liq     = (pair.get("liquidity") or {}).get("usd") or 0
+    vol     = (pair.get("volume") or {}).get("h24") or 0
+    vol_h1  = (pair.get("volume") or {}).get("h1") or 0
+    vol_m5  = (pair.get("volume") or {}).get("m5") or 0
+    pc      = pair.get("priceChange") or {}
+    p5m     = pc.get("m5") or 0
+    p1h     = pc.get("h1") or 0
+    h1_tx   = (pair.get("txns") or {}).get("h1") or {}
+    m5_tx   = (pair.get("txns") or {}).get("m5") or {}
+    h1_buys = h1_tx.get("buys") or 0
+    m5_buys = m5_tx.get("buys") or 0
+    url     = pair.get("url", "")
+    age     = _pair_age_hours(pair)
+    avg_5m_vol  = vol_h1 / 12 if vol_h1 > 0 else 0
+    vol_accel   = vol_m5 / avg_5m_vol if avg_5m_vol > 0 else 0
+    avg_m5_buys = h1_buys / 12 if h1_buys > 0 else 0
+    buy_accel   = m5_buys / avg_m5_buys if avg_m5_buys > 0 else 0
+    accel_tag   = f"  ACCEL vol:{vol_accel:.1f}x buys:{buy_accel:.1f}x\n" if vol_accel >= 1.5 or buy_accel >= 1.5 else ""
+    prefix      = f"#{rank} " if rank else ""
+    conf_tag    = f"  Confidence: {conf:.0f}/100\n" if conf is not None else ""
+    early_tag   = "  EARLY LAUNCH\n" if early else ""
+    news_lines  = "".join(f"  NEWS: {h}\n" for h in (news or []))
+    age_str     = f"{age * 60:.0f}min" if early else f"{age:.1f}h"
     return (
         f"{prefix}{sym} ({name})\n"
         f"   Score: {score:.0f}/100  Age: {age_str}\n"
